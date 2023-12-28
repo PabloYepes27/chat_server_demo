@@ -1,33 +1,42 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use rand::{thread_rng, Rng};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::RwLock;
+use serde::{Serialize, Deserialize};
+use futures_util::{sink::SinkExt, stream::SplitSink, StreamExt};
 
 use axum::{
-    extract::{Extension, Path},
+    extract::{Extension, Path, ws::WebSocket},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
     Router,
-    Server,
+    response::Response,
 };
 
-type Sender = broadcast::Sender<String>;
-
 // Define a struct containing user data like ID and a sender for broadcasting messages.
+/*
 struct Client {
     user_id: usize,
     sender: Sender,
     // channel: ,
     // topic: 
 }
+*/
 
-type Clients = Arc<Mutex<HashMap<String, Client>>>; // Data structure to store connected Clients
+// Dtata structure for messages
+#[derive(Deserialize, Serialize)]
+struct Message {
+    from: String,
+    to: String,
+    message: String
+}
+
+type Clients = Arc<RwLock<HashMap<String, Arc<RwLock<SplitSink<WebSocket, axum::extract::ws::Message>>>>>>; // Data structure to store connected Clients
 
 async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-// Implement Register Handler:
+/* Implement Register Handler:
 async fn register_handler(
     // Extract client details from the registration request
     extracted_client_id: String,
@@ -50,64 +59,64 @@ async fn register_handler(
     // Return a successful response
     StatusCode::CREATED
 }
+*/
 
 // Implement WebSocket Handler
 async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    Extension(clients): Extension<Arc<Mutex<HashMap<String, Client>>>>,
+    Extension(clients): Extension<Clients>,
     Path(client_id): Path<String>,
-) -> impl axum::response::IntoResponse {
-    let client = Client {
-        user_id: 1 /* assign a valid user_id here */,
-        sender: broadcast::channel(100).0,
-    };
-
-    let mut clients = clients.lock().await;
-    clients.insert(client_id.clone(), client);
-
+) -> Response {
     // Accept websocket connection upgrades
-    ws.on_upgrade(|mut socket| async move {
-        while let Some(msg) = socket.recv().await {
-            match msg {
-                Ok(msg) => {
-                    let data = msg.into_data();
-                    let message = String::from_utf8_lossy(&data);
+    ws.on_upgrade(move |socket|{upgrade(socket, clients, client_id)})
+}
 
+async fn upgrade(socket: WebSocket, clients: Clients, client_id: String){
+        let (sender, mut receiver) = socket.split();
 
-                    // Broadcast message to other clients
-                    let clients = clients.lock().await;
+        let client_sender = Arc::new(RwLock::new(sender));
+        clients.write().await.insert(client_id, client_sender);
 
-                    // Start a loop to receive messages
-                    for (_, client) in clients.iter_mut() {
-                        if client.user_id != client_id {  // Exclude sender
-                            client.sender.send(message.clone()).unwrap();
+        // Start a loop to receive messages
+        while let Some(msg) = receiver.next().await {
+            if let Ok(msg) = msg{
+                match msg {
+                    axum::extract::ws::Message::Text(text) => {
+                        let message: Result<Message, _> = serde_json::from_str(&text);
+                        match message {
+                            Ok(message) => {
+                                let to = message.to;
+                                let clients = clients.read().await;
+                                let client = clients.get(&to);
+                                match client {
+                                    Some(client) => {
+                                        client.write().await.send(axum::extract::ws::Message::Text(text)).await;
+                                    },
+                                    None => {},
+                                }
+                            },
+                            Err(err) => {
+                                eprintln!("WebSocket error: {}", err);
+                            }
                         }
-                    }
-                }
-                // Handle websocket errors gracefully
-                Err(err) => {
-                    eprintln!("WebSocket error: {}", err);
-                    break;
+                    },
+                    axum::extract::ws::Message::Close(_) => todo!(),
+                    _ => {}
                 }
             }
         }
-    });
+    }
 
-    // Close the connection on disconnect
-    // ws.on_closed()
-}
 
 #[tokio::main]
 async fn main() {
-    let clients = Arc::new(Mutex::new(HashMap::<String, Client>::new()));
+    let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
     let app = Router::new()
         .route("/health", get(health_handler)) // To test the healt of the server
-        .route("/register", post(register_handler)) // To register a client
+        // .route("/register", post(register_handler)) // To register a client
         .route("/ws/:client_id", get(ws_handler))  // To handle web socket connections, including opening, receiving messages, broadcasting messages to other clients, and closing connections
         .layer(Extension(clients));
 
-    Server::bind(&"127.0.0.1:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
